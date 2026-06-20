@@ -4,7 +4,7 @@ name: Forge Ultra Native Build
 # Builds Android (.apk), iOS (.ipa), or Windows (.exe) — fully white-labeled,
 # auto-rebranded, with native asset generation + live HMAC-signed log streaming.
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       app_id:            { description: "Forge app id",     required: true }
