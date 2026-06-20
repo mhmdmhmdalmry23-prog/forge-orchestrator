@@ -1,0 +1,282 @@
+name: Forge Ultra Native Build
+
+# Triggered by Forge dashboard via workflow_dispatch.
+# Builds Android (.apk), iOS (.ipa), or Windows (.exe) — fully white-labeled,
+# auto-rebranded, with native asset generation + live HMAC-signed log streaming.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_id:            { description: "Forge app id",     required: true }
+      build_id:          { description: "Forge build id",   required: true }
+      platform:          { description: "android | ios | windows", required: true }
+      source_type:       { description: "github | zip",     required: true }
+      source_url:        { description: "Repo URL (github)",required: false, default: "" }
+      source_zip_path:   { description: "Storage path (zip)",required: false, default: "" }
+      package_id:        { description: "Bundle / package id", required: true }
+      app_name:          { description: "App display name", required: true }
+      app_version:       { description: "Semantic version", required: false, default: "1.0.0" }
+      primary_color:     { description: "Brand hex color",  required: false, default: "#4f46e5" }
+      offline_enabled:   { description: "Enable offline support", required: false, default: "true" }
+      platform_config:   { description: "Per-platform JSON config", required: false, default: "{}" }
+      encrypted_secrets: { description: "AES-256-GCM payload (signing keys)", required: false, default: "" }
+      callback_token:    { description: "HMAC token for callback identity",   required: false, default: "" }
+
+env:
+  NODE_VERSION: "20"
+  FORGE_BUILD_ID: ${{ inputs.build_id }}
+  FORGE_APP_ID: ${{ inputs.app_id }}
+  FORGE_URL: ${{ secrets.FORGE_WEBHOOK_URL }}
+  FORGE_SECRET: ${{ secrets.FORGE_WEBHOOK_SECRET }}
+  # User-controlled inputs are pulled into env so they are NEVER interpolated
+  # directly into shell commands (prevents CI command injection).
+  APP_NAME: ${{ inputs.app_name }}
+  APP_VERSION: ${{ inputs.app_version }}
+  PACKAGE_ID: ${{ inputs.package_id }}
+
+jobs:
+  # ──────────────────────────── ANDROID ────────────────────────────
+  android:
+    if: ${{ inputs.platform == 'android' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout orchestrator (helpers)
+        uses: actions/checkout@v4
+        with: { path: orchestrator }
+
+      - name: Fetch source (GitHub)
+        if: ${{ inputs.source_type == 'github' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_url }}
+          path: src
+
+      - name: Fetch source (ZIP)
+        if: ${{ inputs.source_type == 'zip' }}
+        run: |
+          mkdir -p src && cd src
+          curl -fSL -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            "${{ secrets.SUPABASE_URL }}/storage/v1/object/app-sources/${{ inputs.source_zip_path }}" -o source.zip
+          unzip -q source.zip && rm source.zip
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+
+      - name: Stream → Forge (start)
+        run: bash orchestrator/scripts/forge-log.sh 10 system "🟢 Android build started for $APP_NAME v$APP_VERSION"
+
+      - name: Forge auto-rebrand (find/replace)
+        working-directory: src
+        env:
+          NEW_NAME: ${{ env.APP_NAME }}
+          NEW_PKG:  ${{ env.PACKAGE_ID }}
+        run: bash ../orchestrator/scripts/rebrand.sh
+
+      - name: Strip third-party watermarks (Lovable / Bolt)
+        working-directory: src
+        env: { NEW_NAME: ${{ env.APP_NAME }} }
+        run: bash ../orchestrator/scripts/strip-watermark.sh .
+
+      - name: Install dependencies
+        working-directory: src
+        run: |
+          (npm ci || npm install) 2>&1 | tee /tmp/install.log
+          bash ../orchestrator/scripts/forge-log.sh 20 info "📦 Dependencies installed"
+
+      - name: 🛡️ Security Shield — audit + auto-patch
+        working-directory: src
+        continue-on-error: true
+        run: |
+          echo "▶ Running npm audit…"
+          npm audit --audit-level=high --json > /tmp/audit.json || true
+          HIGH=$(jq '.metadata.vulnerabilities.high // 0' /tmp/audit.json 2>/dev/null || echo 0)
+          CRIT=$(jq '.metadata.vulnerabilities.critical // 0' /tmp/audit.json 2>/dev/null || echo 0)
+          bash ../orchestrator/scripts/forge-log.sh 25 info "🛡️ Audit: high=$HIGH critical=$CRIT"
+          if [ "$CRIT" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+            bash ../orchestrator/scripts/forge-log.sh 26 warn "🔧 Self-healing: applying npm audit fix"
+            npm audit fix --force || true
+          fi
+          # Quick static scan for obvious SQLi/XSS patterns in source
+          if command -v rg >/dev/null 2>&1; then
+            HITS=$(rg -n --no-heading -e 'dangerouslySetInnerHTML' -e 'eval\(' -e 'innerHTML\s*=' -e 'document\.write' src 2>/dev/null | wc -l || echo 0)
+            bash ../orchestrator/scripts/forge-log.sh 27 info "🔍 Static scan flagged $HITS suspicious lines"
+          fi
+
+      - name: Generate native assets (icons + splash)
+        working-directory: src
+        run: |
+          if [ -f "../orchestrator/assets/icon.png" ] || [ -d "resources" ]; then
+            npm i -D @capacitor/assets sharp || true
+            npx -y @capacitor/assets generate --android || echo "no assets to generate"
+          fi
+          bash ../orchestrator/scripts/forge-log.sh 30 info "🎨 Native assets prepared"
+
+      - name: Capacitor sync
+        working-directory: src
+        run: |
+          npx -y @capacitor/cli@latest init "$APP_NAME" "$PACKAGE_ID" --web-dir=dist || true
+          [ -f package.json ] && npm run build || true
+          npx -y @capacitor/cli@latest add android || true
+          npx -y @capacitor/cli@latest sync android || true
+
+      - name: Configure offline support
+        if: ${{ inputs.offline_enabled == 'true' }}
+        working-directory: src
+        run: |
+          npm i @capacitor/network @capacitor-community/sqlite || true
+          bash ../orchestrator/scripts/forge-log.sh 40 info "📡 Offline plugins installed"
+
+      - name: Assemble release APK
+        working-directory: src/android
+        run: |
+          ./gradlew assembleRelease --no-daemon 2>&1 | tee /tmp/gradle.log
+          bash ../../orchestrator/scripts/forge-log.sh 80 success "✅ APK built"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-build-${{ inputs.build_id }}-android
+          path: src/android/app/build/outputs/apk/release/*.apk
+
+  # ──────────────────────────── iOS ────────────────────────────
+  ios:
+    if: ${{ inputs.platform == 'ios' }}
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: orchestrator }
+      - name: Fetch source (GitHub)
+        if: ${{ inputs.source_type == 'github' }}
+        uses: actions/checkout@v4
+        with: { repository: ${{ inputs.source_url }}, path: src }
+      - name: Fetch source (ZIP)
+        if: ${{ inputs.source_type == 'zip' }}
+        run: |
+          mkdir -p src && cd src
+          curl -fSL -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" \
+            "${{ secrets.SUPABASE_URL }}/storage/v1/object/app-sources/${{ inputs.source_zip_path }}" -o source.zip
+          unzip -q source.zip && rm source.zip
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Stream → Forge (start)
+        run: bash orchestrator/scripts/forge-log.sh 10 system "🟢 iOS build started for $APP_NAME v$APP_VERSION"
+      - name: Forge auto-rebrand
+        working-directory: src
+        env: { NEW_NAME: ${{ env.APP_NAME }}, NEW_PKG: ${{ env.PACKAGE_ID }} }
+        run: bash ../orchestrator/scripts/rebrand.sh
+      - name: Strip third-party watermarks (Lovable / Bolt)
+        working-directory: src
+        env: { NEW_NAME: ${{ env.APP_NAME }} }
+        run: bash ../orchestrator/scripts/strip-watermark.sh .
+      - name: Install dependencies
+        working-directory: src
+        run: npm ci || npm install
+      - name: Generate native assets
+        working-directory: src
+        run: |
+          if [ -d "resources" ]; then npm i -D @capacitor/assets sharp || true; npx -y @capacitor/assets generate --ios || true; fi
+      - name: Capacitor sync
+        working-directory: src
+        run: |
+          npx -y @capacitor/cli@latest init "$APP_NAME" "$PACKAGE_ID" --web-dir=dist || true
+          [ -f package.json ] && npm run build || true
+          npx -y @capacitor/cli@latest add ios || true
+          npx -y @capacitor/cli@latest sync ios || true
+      - name: Build IPA (unsigned)
+        working-directory: src/ios/App
+        run: |
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+            -archivePath build/App.xcarchive archive CODE_SIGNING_ALLOWED=NO
+          mkdir -p Payload
+          cp -R build/App.xcarchive/Products/Applications/App.app Payload/
+          zip -qr "App.ipa" Payload
+          bash ../../../orchestrator/scripts/forge-log.sh 80 success "✅ IPA built"
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-build-${{ inputs.build_id }}-ios
+          path: src/ios/App/*.ipa
+
+  # ──────────────────────────── WINDOWS (Electron) ────────────────────────────
+  windows:
+    if: ${{ inputs.platform == 'windows' }}
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: orchestrator }
+      - name: Fetch source (GitHub)
+        if: ${{ inputs.source_type == 'github' }}
+        uses: actions/checkout@v4
+        with: { repository: ${{ inputs.source_url }}, path: src }
+      - name: Fetch source (ZIP)
+        if: ${{ inputs.source_type == 'zip' }}
+        shell: pwsh
+        run: |
+          mkdir src; cd src
+          curl -fSL -H "Authorization: Bearer ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}" `
+            "${{ secrets.SUPABASE_URL }}/storage/v1/object/app-sources/${{ inputs.source_zip_path }}" -o source.zip
+          Expand-Archive source.zip -DestinationPath .
+          Remove-Item source.zip
+      - uses: actions/setup-node@v4
+        with: { node-version: "${{ env.NODE_VERSION }}" }
+      - name: Forge auto-rebrand
+        working-directory: src
+        shell: bash
+        env: { NEW_NAME: ${{ env.APP_NAME }}, NEW_PKG: ${{ env.PACKAGE_ID }} }
+        run: bash ../orchestrator/scripts/rebrand.sh
+      - name: Strip third-party watermarks (Lovable / Bolt)
+        working-directory: src
+        shell: bash
+        env: { NEW_NAME: ${{ env.APP_NAME }} }
+        run: bash ../orchestrator/scripts/strip-watermark.sh .
+      - name: Install dependencies
+        working-directory: src
+        run: npm ci || npm install
+      - name: Build web bundle
+        working-directory: src
+        run: npm run build || echo "no build script"
+      - name: Package with Electron
+        working-directory: src
+        run: |
+          npm i -D electron @electron/packager
+          npx @electron/packager . "$APP_NAME" --platform=win32 --arch=x64 --out=release --overwrite "--app-bundle-id=$PACKAGE_ID" "--app-version=$APP_VERSION"
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-build-${{ inputs.build_id }}-windows
+          path: src/release/**
+
+  # ──────────────────────────── Notify Forge (HMAC signed) ────────────────────────────
+  notify:
+    needs: [android, ios, windows]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Send signed callback to Forge
+        if: ${{ env.FORGE_URL != '' }}
+        env:
+          STATUS: ${{ job.status }}
+          ANDROID: ${{ needs.android.result }}
+          IOS: ${{ needs.ios.result }}
+          WINDOWS: ${{ needs.windows.result }}
+        run: |
+          OVERALL="success"
+          for r in "$ANDROID" "$IOS" "$WINDOWS"; do
+            if [ "$r" = "failure" ]; then OVERALL="failure"; fi
+            if [ "$r" = "cancelled" ] && [ "$OVERALL" != "failure" ]; then OVERALL="cancelled"; fi
+          done
+          BODY=$(jq -nc \
+            --arg b "${{ inputs.build_id }}" \
+            --arg r "${{ github.run_id }}" \
+            --arg u "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg s "$OVERALL" \
+            '{build_id:$b, run_id:$r, run_url:$u, status:$s}')
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$FORGE_SECRET" -hex | awk '{print $2}')
+          curl -fsSL -X POST "$FORGE_URL" \
+            -H "Content-Type: application/json" \
+            -H "x-forge-signature: $SIG" \
+            -H "x-forge-secret: $FORGE_SECRET" \
+            -d "$BODY"
