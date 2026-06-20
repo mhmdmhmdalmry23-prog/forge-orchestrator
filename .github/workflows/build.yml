@@ -4,7 +4,7 @@ name: Forge Ultra Native Build
 # Builds Android (.apk), iOS (.ipa), or Windows (.exe) — fully white-labeled,
 # auto-rebranded, with native asset generation + live HMAC-signed log streaming.
 
-"on":
+on:
   workflow_dispatch:
     inputs:
       app_id:            { description: "Forge app id",     required: true }
@@ -60,9 +60,12 @@ jobs:
           unzip -q source.zip && rm source.zip
 
       - uses: actions/setup-node@v4
-        with: { node-version: "${{ env.NODE_VERSION }}" }
+        with:
+          node-version: "20"
       - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: "17" }
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - name: Stream → Forge (start)
         run: bash orchestrator/scripts/forge-log.sh 10 system "🟢 Android build started for $APP_NAME v$APP_VERSION"
@@ -76,7 +79,8 @@ jobs:
 
       - name: Strip third-party watermarks (Lovable / Bolt)
         working-directory: src
-        env: { NEW_NAME: ${{ env.APP_NAME }} }
+        env:
+          NEW_NAME: ${{ env.APP_NAME }}
         run: bash ../orchestrator/scripts/strip-watermark.sh .
 
       - name: Install dependencies
@@ -146,11 +150,14 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: orchestrator }
+        with:
+          path: orchestrator
       - name: Fetch source (GitHub)
         if: ${{ inputs.source_type == 'github' }}
         uses: actions/checkout@v4
-        with: { repository: ${{ inputs.source_url }}, path: src }
+        with:
+          repository: ${{ inputs.source_url }}
+          path: src
       - name: Fetch source (ZIP)
         if: ${{ inputs.source_type == 'zip' }}
         run: |
@@ -159,16 +166,20 @@ jobs:
             "${{ secrets.SUPABASE_URL }}/storage/v1/object/app-sources/${{ inputs.source_zip_path }}" -o source.zip
           unzip -q source.zip && rm source.zip
       - uses: actions/setup-node@v4
-        with: { node-version: "${{ env.NODE_VERSION }}" }
+        with:
+          node-version: "20"
       - name: Stream → Forge (start)
         run: bash orchestrator/scripts/forge-log.sh 10 system "🟢 iOS build started for $APP_NAME v$APP_VERSION"
       - name: Forge auto-rebrand
         working-directory: src
-        env: { NEW_NAME: ${{ env.APP_NAME }}, NEW_PKG: ${{ env.PACKAGE_ID }} }
+        env:
+          NEW_NAME: ${{ env.APP_NAME }}
+          NEW_PKG: ${{ env.PACKAGE_ID }}
         run: bash ../orchestrator/scripts/rebrand.sh
       - name: Strip third-party watermarks (Lovable / Bolt)
         working-directory: src
-        env: { NEW_NAME: ${{ env.APP_NAME }} }
+        env:
+          NEW_NAME: ${{ env.APP_NAME }}
         run: bash ../orchestrator/scripts/strip-watermark.sh .
       - name: Install dependencies
         working-directory: src
@@ -205,11 +216,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with: { path: orchestrator }
+        with:
+          path: orchestrator
       - name: Fetch source (GitHub)
         if: ${{ inputs.source_type == 'github' }}
         uses: actions/checkout@v4
-        with: { repository: ${{ inputs.source_url }}, path: src }
+        with:
+          repository: ${{ inputs.source_url }}
+          path: src
       - name: Fetch source (ZIP)
         if: ${{ inputs.source_type == 'zip' }}
         shell: pwsh
@@ -220,16 +234,20 @@ jobs:
           Expand-Archive source.zip -DestinationPath .
           Remove-Item source.zip
       - uses: actions/setup-node@v4
-        with: { node-version: "${{ env.NODE_VERSION }}" }
+        with:
+          node-version: "20"
       - name: Forge auto-rebrand
         working-directory: src
         shell: bash
-        env: { NEW_NAME: ${{ env.APP_NAME }}, NEW_PKG: ${{ env.PACKAGE_ID }} }
+        env:
+          NEW_NAME: ${{ env.APP_NAME }}
+          NEW_PKG: ${{ env.PACKAGE_ID }}
         run: bash ../orchestrator/scripts/rebrand.sh
       - name: Strip third-party watermarks (Lovable / Bolt)
         working-directory: src
         shell: bash
-        env: { NEW_NAME: ${{ env.APP_NAME }} }
+        env:
+          NEW_NAME: ${{ env.APP_NAME }}
         run: bash ../orchestrator/scripts/strip-watermark.sh .
       - name: Install dependencies
         working-directory: src
